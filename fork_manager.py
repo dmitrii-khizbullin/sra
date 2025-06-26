@@ -23,7 +23,7 @@ TOOLS = [
                 "that you think are essential to the task you give to it. "
                 "First, form message_ids as a list if Message IDs (MIDs). An MID is a alphanumerical tag "
                 "in square brackets that is prepended to every system, user and assistant message. "
-                "Example of an MID: [A1B2]. "
+                "Example of an MID prefix in message content: [A1B2] Blah blah. The MID itself is A1B2 here. "
                 "Second, pass your message/task/query to the forked agent in the message field. "
                 "The tool returns a Thread ID (TID) to be later joined."
                 "Do not forget to join the threads with the TIDs you own before exiting, "
@@ -121,7 +121,7 @@ or you want to run errands, you can fork yourself, shape the message history as 
 the message_ids and message parameters, and then join the threads to get the results of the forked conversations.
 Before joining the threads that you forked, you check their status with the status tool.
 Remember that when you call a fork tool, your message history is not automatically inherited by the forked agent.
-You must explicitly provide the forked agent with the list of Message IDs (MIDs) that you think are essential to the task you give to it via the message_ids parameter. The task itself can be given in the message parameter.
+You must explicitly provide the forked agent with the list of Message IDs (MIDs) without square brackets that you think are essential to the task you give to it via the message_ids parameter. The task itself can be given in the message parameter.
 You can also use the status tool to get the status of all threads launched by this thread. You can thus check if one of the LLM threads you launched is already finished, you can join it and leave the others running.
 When you are done with the task, you MUST use the finish tool to return the results of your operation.
 Remember that if you do not use the finish tool, nothing will be returned to the caller agent or the user.
@@ -205,7 +205,6 @@ class ForkManager:
                  ):
         self.llm = llm
         self.tools = tools
-        # self.tools = remove_forking_tools(tools) # TEMPORARY
 
         self.max_tokens = 1000
 
@@ -381,7 +380,13 @@ class ForkManager:
                 messages_forking = messages.copy()
                 messages_forking.append(tool_call)
                 unexpected_args = set(tool_args.keys()) - {"message_ids", "message"}
-                if len(unexpected_args) == 0:
+                no_unexpected_args = len(unexpected_args) == 0
+                is_message_good = (("message" not in tool_args) or
+                                   isinstance(tool_args["message"], str))
+                is_message_ids_good = (("message_ids" not in tool_args) or
+                                       (isinstance(tool_args["message_ids"], list) and
+                                        all(isinstance(x, str) for x in tool_args["message_ids"])))
+                if no_unexpected_args and is_message_good and is_message_ids_good:
                     tool_answer = self.fork(
                         my_tid=my_tid,
                         messages=messages_forking,
@@ -390,7 +395,16 @@ class ForkManager:
                 else:
                     tool_answer = "Invalid arguments for fork."
             elif tool_name == 'join':
-                tool_answer = self.join(my_tid, **tool_args)
+                unexpected_args = set(tool_args.keys()) - {"tids"}
+                no_unexpected_args = len(unexpected_args) == 0
+                is_tids_good = "tids" in tool_args and (
+                    isinstance(tool_args["tids"], list) and
+                    all(isinstance(x, str) for x in tool_args["tids"])
+                    )
+                if no_unexpected_args and is_tids_good:
+                    tool_answer = self.join(my_tid, **tool_args)
+                else:
+                    tool_answer = "Invalid arguments for join."
             elif tool_name == 'status':
                 tool_answer = self.status(my_tid)
             elif tool_name == 'finish':
@@ -483,8 +497,43 @@ class ForkManager:
                         unfinished_tids.remove(tid)
             time.sleep(1.0)
 
+    def save_thread_records(self, filename_wo_ext: str) -> None:
+        # save thread records as a JSON file without the future objects
+        with self.thread_records_lock:
+            records_to_save = {
+                tid: {
+                    "parent_tid": record["parent_tid"],
+                    "child_tids": record["child_tids"],
+                    "level": record["level"],
+                }
+                for tid, record in self.thread_records.items()
+            }
+            with open(f"{filename_wo_ext}.json", 'w') as f:
+                json.dump(records_to_save, f, indent=4)
+
+        # save thread records as a dot graph file
+        with self.thread_records_lock:
+            with open(f"{filename_wo_ext}.dot", 'w') as f:
+                f.write("digraph G {\n")
+                for tid, record in self.thread_records.items():
+                    parent_tid = record['parent_tid']
+                    if parent_tid is not None:
+                        f.write(f'    "{parent_tid}" -> "{tid}";\n')
+                f.write("}\n")
+        
+        # render this dot file to a PNG image using graphviz
+        try:
+            import graphviz
+            dot = graphviz.Source.from_file(f"{filename_wo_ext}.dot")
+            dot.format = 'png'
+            dot.render(filename_wo_ext, cleanup=True)
+            print(f"Graph saved as {filename_wo_ext}.png")
+        except Exception as e:
+            print(f"Error rendering graph: {e}")
+
     def run_entry(self, messages):
-        max_words = self.max_tokens // 2  # Rough estimate of words based on tokens
+        safety_gap = 2.0
+        max_words = self.max_tokens // 2 // safety_gap # Rough estimate of words based on tokens
 
         system_message = SYSTEM_MESSAGE_TEMPLATE.format(
             max_turns=self.max_turns,
@@ -512,6 +561,9 @@ class ForkManager:
         whatever = self.run_agent(new_tid, messages, self.tools) # start with all tools
 
         self.join_all_threads()
+
+        name_with_datetime = "graph_" + time.strftime("%Y%m%d_%H%M%S")
+        self.save_thread_records(name_with_datetime)
 
         return whatever
 
