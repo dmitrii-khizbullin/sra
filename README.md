@@ -2,7 +2,7 @@ Run vllm server:
 
 ```
 python -m vllm.entrypoints.openai.api_server \
-  --model "Qwen/Qwen2.5-1.5B-Instruct" \
+  --model "Qwen/Qwen3-30B-A3B" \
   --tensor-parallel-size 4 \
   --gpu-memory-utilization 0.5 \
   --host 0.0.0.0 \
@@ -11,3 +11,6 @@ python -m vllm.entrypoints.openai.api_server \
   --tool-call-parser hermes
 ```
 
+```
+python fork_manager.py
+```

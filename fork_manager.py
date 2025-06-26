@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from typing import Any
 import string
 import random
@@ -108,8 +110,8 @@ TOOLS = [
 ]
 
 
-SYSTEM_MESSAGE = """
-You are a helpful assistant that can solve problems.
+SYSTEM_MESSAGE_TEMPLATE = """
+You are a helpful agent that can solve problems. As an agent you can make multiple turns to solve the problem.
 You must parallelize your operation as much as possible to minimize the time to the final answer.
 Use the tools at your disposal. Do not try using any other tools that are not listed.
 If the set of fork, join and status tools are available, you are highly encouraged to use them.
@@ -117,10 +119,18 @@ The way fork-join works is it launches a separate LLm conversation (a thread) th
 in parallel with your main conversation. Thus, if you want to try multiple ideas or approaches,
 or you want to run errands, you can fork yourself, shape the message history as you want with
 the message_ids and message parameters, and then join the threads to get the results of the forked conversations.
+Before joining the threads that you forked, you check their status with the status tool.
 Remember that when you call a fork tool, your message history is not automatically inherited by the forked agent.
 You must explicitly provide the forked agent with the list of Message IDs (MIDs) that you think are essential to the task you give to it via the message_ids parameter. The task itself can be given in the message parameter.
 You can also use the status tool to get the status of all threads launched by this thread. You can thus check if one of the LLM threads you launched is already finished, you can join it and leave the others running.
-When you are done with the task, you can use the finish tool to return the results of your operation.
+When you are done with the task, you MUST use the finish tool to return the results of your operation.
+Remember that if you do not use the finish tool, nothing will be returned to the caller agent or the user.
+You MUST use the finish tool to return the results of your operation.
+The user will be very disappointed if the answer/response is not returned to them. Make the user happy in this respect.
+You MUST use at least one tool in your response.
+Do not use thinking too much, rely more on using the tools to solve the problem and delegating subploblems.
+You as the main thread or any other thread will have {max_turns} turns to solve the problem.
+Every your response must be less than {max_words} words including tool call arguments.
 """
 
 
@@ -194,21 +204,19 @@ class ForkManager:
                  tools: list[dict[str, Any]],
                  ):
         self.llm = llm
-        # self.tools = tools
-        self.tools = remove_forking_tools(tools) # TEMPORARY
+        self.tools = tools
+        # self.tools = remove_forking_tools(tools) # TEMPORARY
 
-        self.sampling_params = SamplingParams(max_tokens=1000, temperature=0.0)
+        self.max_tokens = 1000
 
-        self.tools_functions = {
-            "fork": self.fork,
-            "join": self.join,
-            "status": self.status,
-            "finish": self.finish,
-        }
+        self.sampling_params = SamplingParams(max_tokens=self.max_tokens, temperature=0.0)
+
+        self.tools_functions: set[str] = {"fork", "join", "status", "finish"}
 
         self.thread_pool = concurrent.futures.ThreadPoolExecutor()
 
         self.thread_records: dict[str, dict[str, Any]] = {}
+        self.thread_records_lock = threading.Lock()
 
         self.tid_length = 3 # Thread ID, chars
         self.tcid_length = 2 # Tool Call ID, chars
@@ -216,7 +224,7 @@ class ForkManager:
 
         self.max_turns = 10
 
-        self.max_forking_level = 1
+        self.max_forking_level = 3
 
     def fork(
         self,
@@ -226,23 +234,42 @@ class ForkManager:
         message: str | None = None,
         message_ids: list[str] | None = None,
     ) -> str:
+        # Always add the system message
+        if len(messages) > 0:
+            first_message = messages[0]
+            if first_message["role"] == "system":
+                mid = extract_mid(first_message)
+                if mid is not None:
+                    message_ids = [mid] if message_ids is None else [mid] + message_ids
+
         selected_messages = []
-        if len(message_ids) > 0:
-            for message in messages:
-                mid = extract_mid(message)
+        if message_ids is not None and len(message_ids) > 0:
+            for m in messages:
+                mid = extract_mid(m)
                 if mid is not None and mid in message_ids:
-                    selected_messages.append(message)
+                    selected_messages.append(m)
+
         if message is not None:
-            selected_messages.append({"role": "user", "content": message})
-        if self.thread_records[my_tid]['level'] >= self.max_forking_level:
+            user_message = {"role": "user", "content": message}
+            user_message = tag_message(user_message, self.mid_length)
+            selected_messages.append(user_message)
+
+        with self.thread_records_lock:
+            my_level = self.thread_records[my_tid]['level']
+        if my_level >= self.max_forking_level-1:
             tools = remove_forking_tools(tools)
+
         future_tid = self.submit_task(my_tid, selected_messages, tools)
+
         return f"Forked TID: {future_tid}"
 
-    def join(self, tids: list[str]) -> str:
+    def join(self, my_tid: str, tids: list[str]) -> str:
         results: list[str] = []
+        if my_tid not in self.thread_records:
+            raise ValueError(f"Thread {my_tid} does not exist.")
+        my_record = self.thread_records[my_tid]
         for tid in tids:
-            if tid in self.thread_records:
+            if tid in my_record['child_tids']:
                 future: concurrent.futures.Future
                 future = self.thread_records[tid]['future']
                 if future is not None:
@@ -251,30 +278,44 @@ class ForkManager:
                 else:
                     raise ValueError(f"Thread {tid} has no future associated with it.")
             else:
-                raise ValueError(f"Thread {tid} does not exist.")
+                results.append(f"Thread {tid} does not exist or is not owned by this thread. Can't join it.")
         results_str = "Successfully joined threads.\n\n"
         for result in results:
             results_str += f"Thread {result}\n"
             results_str += f"{result}\n\n"
         return results_str
 
-    def status(self) -> str:
+    def status(self, my_tid: str) -> str:
         status_lines = []
-        for tid, record in self.thread_records.items():
-            parent_tid = record['parent_tid']
-            child_tids = record['child_tids']
-            future: concurrent.futures.Future = record['future']
-            if future is not None:
-                status = "Running" if not future.done() else "Finished"
-                result = future.result() if future.done() else "Not yet completed"
-            else:
-                status = "Not started"
-                result = "No result available"
-            status_lines.append(
-                f"Thread ID: {tid}, Parent TID: {parent_tid}, "
-                f"Child TIDs: {', '.join(child_tids) if child_tids else 'None'}, "
-                f"Status: {status}, Result: {result}"
-            )
+        with self.thread_records_lock:
+            for tid, record in self.thread_records.items():
+                parent_tid = record['parent_tid']
+                if parent_tid != my_tid:
+                    continue  # Only show threads that are children of the current thread
+                future: concurrent.futures.Future = record['future']
+                if future is not None:
+                    if future.done():
+                        status = "Finished"
+                        future_result = future.result()
+                        if future_result is not None:
+                            status = "Finished"
+                            if isinstance(future_result, str):
+                                result = f"Text of length {len(future_result)}"
+                            else:
+                                raise ValueError(f"Unexpected result type: {type(future_result)}")
+                        else:
+                            result = "The result is None."
+                    else:
+                        status = "Running"
+                        result = "Not yet completed"
+                    status = "Running" if not future.done() else "Finished"
+                    result = f"Text of length {len(future.result())}" if future.done() else "Not yet completed"
+                else:
+                    status = "Main thread"
+                    result = "No result available"
+                status_lines.append(
+                    f"TID: {tid}, Status: {status}, Result: {result}"
+                )
         if not status_lines:
             return "No threads have been created yet."
         return "\n".join(status_lines)
@@ -287,18 +328,18 @@ class ForkManager:
 
         selected_messages = []
         if message_ids is not None and len(message_ids) > 0:
-            for message in messages:
-                mid = extract_mid(message)
+            for m in messages:
+                mid = extract_mid(m)
                 if mid is not None and mid in message_ids:
-                    selected_messages.append(message)
+                    selected_messages.append(m)
 
         result_str = ""
-        for message in selected_messages:
-            if message["role"] in ["system", "user", "assistant"]:
-                result_str += f"{message['role'].capitalize()}: {message['content']}\n"
-            elif message["role"] == "tool":
-                tool_call_id = message.get("tool_call_id", "unknown")
-                result_str += f"Tool Call [{tool_call_id}]: {message['content']}\n"
+        for m in selected_messages:
+            if m["role"] in ["system", "user", "assistant"]:
+                result_str += f"{m['role'].upper()}: {m['content']}\n"
+            elif m["role"] == "tool":
+                tool_call_id = m.get("tool_call_id", "unknown")
+                result_str += f"Tool Call [{tool_call_id}]: {m['content']}\n"
         
         if message is not None:
             result_str += f"Message: {message}\n"
@@ -314,21 +355,59 @@ class ForkManager:
         future = self.thread_pool.submit(
             self.run_agent, new_tid, messages, tools
         )
-        self.thread_records[parent_tid]['child_tids'].append(new_tid)
-        self.thread_records[new_tid] = {
-            "future": future,
-            "parent_tid": parent_tid,
-            "child_tids": [],
-            "level": self.thread_records[parent_tid]['level'] + 1,
-        }
+        with self.thread_records_lock:
+            self.thread_records[parent_tid]['child_tids'].append(new_tid)
+            self.thread_records[new_tid] = {
+                "future": future,
+                "parent_tid": parent_tid,
+                "child_tids": [],
+                "level": self.thread_records[parent_tid]['level'] + 1,
+            }
         return new_tid
 
+    def call_tool(self,
+                  my_tid: str,
+                  tool_call: dict[str, Any],
+                  messages: list[dict[str, Any]],
+                  tools: list[dict[str, Any]],
+                  ) -> str:
+
+        func = tool_call["function"]
+        tool_name = func["name"]
+        tool_args = func["arguments"]
+        if tool_name in self.tools_functions:
+            print(f"MyTID={my_tid}, Tool call: {tool_name}, args: {tool_args}")
+            if tool_name == 'fork':
+                messages_forking = messages.copy()
+                messages_forking.append(tool_call)
+                unexpected_args = set(tool_args.keys()) - {"message_ids", "message"}
+                if len(unexpected_args) == 0:
+                    tool_answer = self.fork(
+                        my_tid=my_tid,
+                        messages=messages_forking,
+                        tools=tools,
+                        **tool_args)
+                else:
+                    tool_answer = "Invalid arguments for fork."
+            elif tool_name == 'join':
+                tool_answer = self.join(my_tid, **tool_args)
+            elif tool_name == 'status':
+                tool_answer = self.status(my_tid)
+            elif tool_name == 'finish':
+                tool_answer = self.finish(messages=messages, **tool_args)
+            else:
+                raise ValueError(f"Unknown tool name: {tool_name}")
+        else:
+            tool_answer = f"Tool {tool_name} does not exist."
+        return tool_answer
+        
     def run_agent(self,
                   my_tid: str,
                   messages: list[dict[str, Any]],
                   tools: list[dict[str, Any]],
                   ) -> str | None:
 
+        result_str: str | None = None
         for i in range(self.max_turns):
             print(f"MyTID={my_tid}, Turn {i+1}/{self.max_turns}")
 
@@ -345,7 +424,6 @@ class ForkManager:
             print(f"MyTID={my_tid}, Assistant: {content}, Tool calls: {tool_calls}")
             tool_answers = []
             is_finish = False
-            result_str: str | None = None
             for tool_call in tool_calls:
                 func = tool_call["function"]
                 tool_name = func["name"]
@@ -368,28 +446,12 @@ class ForkManager:
                     tool_call['role'] = 'tool'
                 if 'id' not in tool_call:
                     tool_call['id'] = generate_random_id(self.tcid_length) # patch
-                func = tool_call["function"]
-                tool_name = func["name"]
-                tool_args = func["arguments"]
-                if tool_name in self.tools_functions:
-                    tool_fn = self.tools_functions[tool_name]
-                    print(f"MyTID={my_tid}, Tool call: {tool_name}, args: {tool_args}")
-                    if tool_name == 'fork':
-                        messages_forking = messages.copy()
-                        messages_forking.append(tool_call)
-                        unexpected_args = set(tool_args.keys()) - {"message_ids", "message"}
-                        if len(unexpected_args) == 0:
-                            tool_answer = self.fork(
-                                my_tid=my_tid,
-                                messages=messages_forking,
-                                tools=tools,
-                                **tool_args)
-                        else:
-                            tool_answer = "Invalid arguments for fork."
-                    else:
-                        tool_answer = tool_fn(**tool_args)
-                else:
-                    tool_answer = f"Tool {tool_name} does not exist."
+                tool_answer = self.call_tool(
+                    my_tid=my_tid,
+                    tool_call=tool_call,
+                    messages=messages,
+                    tools=tools,
+                )
                 tool_answers.append(tool_answer)
             for tool_call, tool_answer in zip(tool_calls, tool_answers):
                 tool_answer_message = {
@@ -400,7 +462,45 @@ class ForkManager:
                 messages.append(tool_answer_message)
         return result_str
 
+    def join_all_threads(self) -> None:
+        with self.thread_records_lock:
+            unfinished_tids = set(self.thread_records.keys())
+        while len(unfinished_tids) > 0:
+            print(f"Waiting for {unfinished_tids} unfinished threads...")
+            with self.thread_records_lock:
+                for tid in list(unfinished_tids):
+                    record = self.thread_records[tid]
+                    if record['future'] is not None:
+                        future: concurrent.futures.Future = record['future']
+                        try:
+                            future.result(timeout=0.001)
+                            print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
+                            unfinished_tids.remove(tid)
+                        except concurrent.futures.TimeoutError:
+                            continue
+                    else:
+                        print(f"Thread {tid} has no future associated with it. Removing it from unfinished threads.")
+                        unfinished_tids.remove(tid)
+            time.sleep(1.0)
+
     def run_entry(self, messages):
+        max_words = self.max_tokens // 2  # Rough estimate of words based on tokens
+
+        system_message = SYSTEM_MESSAGE_TEMPLATE.format(
+            max_turns=self.max_turns,
+            max_words=max_words)
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_message,
+            },
+            {
+                "role": "user",
+                "content": task,
+            },
+        ]
+
         messages = tag_messages(messages, self.mid_length)
         new_tid = generate_random_id(self.tid_length)
         self.thread_records[new_tid] = {
@@ -411,10 +511,8 @@ class ForkManager:
         }
         whatever = self.run_agent(new_tid, messages, self.tools) # start with all tools
 
-        for tid, record in self.thread_records.items():
-            print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
-            if record['future'] is not None:
-                record['future'].result()
+        self.join_all_threads()
+
         return whatever
 
 
@@ -438,19 +536,8 @@ if __name__ == "__main__":
 
     The Question: What should you do to maximize your chances of winning the car?"""
 
-    task = f"Solve the following problem with two different methods:\n\n {problem}"
-
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_MESSAGE,
-        },
-        {
-            "role": "user",
-            "content": task,
-        },
-    ]
+    task = f"Solve the following problem with 5 different methods:\n\n {problem}"
 
     fork_manager = ForkManager(llm, TOOLS)
-    response = fork_manager.run_entry(messages)
+    response = fork_manager.run_entry(task)
     print(response)
