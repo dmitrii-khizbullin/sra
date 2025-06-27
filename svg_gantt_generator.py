@@ -14,6 +14,7 @@ import math
 from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
 
 # (Task name, Bar End spec), Bar end: start, end, None (the same time stamp as another task spec)
 TaskEndSpec = tuple[str, str | None]
@@ -325,6 +326,13 @@ class SVGGanttGenerator:
                 svg_parts.append(f'<text x="{badge_x}" y="{y + 12}" '
                                f'class="task-text" fill="white" font-size="8px">'
                                f'{task.priority.upper()}</text>')
+
+            # task.description
+            if task.description:
+                desc_x = x + width + 5
+                svg_parts.append(f'<text x="{desc_x}" y="{y + 15}" '
+                               f'class="task-text" fill="#666" font-size="10px">'
+                               f'{task.description}</text>')
         
         return '\n'.join(svg_parts)
     
@@ -538,229 +546,17 @@ class SVGGanttGenerator:
         print(f"HTML Gantt chart saved to {filename}")
 
 
-# ============================================================================
-# Example usage and demonstration
-# ============================================================================
-
-def demo_basic_usage():
-    """Demonstrate basic usage of the SVGGanttGenerator."""
-    print("=== Demo: Basic Usage ===")
-    
-    # Create generator
-    gantt = SVGGanttGenerator()
-    gantt.set_title("Basic Processing Pipeline", "Simple task scheduling example")
-    
-    # Add tasks
-    tasks = [
-        Task("Task 1", 0, 30, "#ff6b6b"),
-        Task("Task 2", 25, 45, "#4ecdc4"),
-        Task("Task 3", 60, 20, "#45b7d1"),
-        Task("Task 4", 50, 40, "#96ceb4")
-    ]
-    
-    for task in tasks:
-        gantt.add_task(task)
-    
-    # Generate and save
-    gantt.save_html("demo_basic.html")
-    return gantt
-
-
-def demo_priority_scheduling():
-    """Demonstrate priority-based scheduling."""
-    print("\n=== Demo: Priority Scheduling ===")
-    
-    gantt = SVGGanttGenerator(width=1000, height=400)
-    gantt.set_title("Priority-Based Task Scheduling", "Tasks with different priority levels")
-    
-    # Add tasks with priorities
-    tasks = [
-        Task("Critical Alert", 0, 60, priority="critical"),
-        Task("High CPU Monitor", 5, 55, priority="high"),
-        Task("Medium Memory Check", 10, 40, priority="medium"),
-        Task("Low Background Sync", 15, 45, priority="low"),
-        Task("Security Scan", 20, 25, priority="high"),
-        Task("Log Cleanup", 30, 15, priority="low"),
-    ]
-    
-    for task in tasks:
-        gantt.add_task(task)
-    
-    # Add some milestones
-    gantt.add_milestone(30, "Checkpoint 1")
-    gantt.add_milestone(60, "System Ready")
-    
-    gantt.save_html("demo_priority.html")
-    return gantt
-
-
-def demo_sub_second_precision():
-    """Demonstrate sub-second precision timing."""
-    print("\n=== Demo: Sub-second Precision ===")
-    
-    gantt = SVGGanttGenerator(width=800, height=300)
-    gantt.set_title("Microsecond Precision Timing", "High-resolution task timing")
-    
-    # Add tasks with sub-second durations
-    tasks = [
-        Task("Init Process", 0.0, 2.5, "#ff9ff3"),
-        Task("Load Data", 1.8, 3.2, "#54a0ff"),
-        Task("Process Batch 1", 4.5, 1.8, "#5f27cd"),
-        Task("Process Batch 2", 6.0, 2.1, "#00d2d3"),
-        Task("Cleanup", 8.5, 0.7, "#ff6348")
-    ]
-    
-    for task in tasks:
-        gantt.add_task(task)
-    
-    # Add dependencies
-    gantt.add_dependency(("Init Process", "end"), ("Load Data", "start"))
-    gantt.add_dependency(("Load Data", "end"), ("Process Batch 1", "start"))
-    gantt.add_dependency(("Process Batch 1", "end"), ("Process Batch 2", "start"))
-    
-    gantt.save_html("demo_precision.html")
-    return gantt
-
-
-def demo_and_run_examples():
-    """Run examples and demonstrate saving capabilities."""
-    print("Running SVG Gantt Generator Examples")
-    print("=" * 45)
-    
-    # Example 1: Basic usage with save_svg()
-    print("\n1. Creating basic pipeline chart...")
-    gantt1 = SVGGanttGenerator(width=800, height=250)
-    gantt1.set_title("Basic Processing Pipeline")
-    
-    tasks1 = [
-        Task("Task 1", 0, 30, "#ff6b6b"),
-        Task("Task 2", 25, 45, "#4ecdc4"),
-        Task("Task 3", 60, 20, "#45b7d1"),
-        Task("Task 4", 50, 40, "#96ceb4")
-    ]
-    
-    for task in tasks1:
-        gantt1.add_task(task)
-    
-    gantt1.save_svg("basic_pipeline.svg")
-    gantt1.save_html("basic_pipeline.html")
-    
-    # Example 2: Priority-based scheduling
-    print("\n2. Creating priority scheduling chart...")
-    gantt2 = SVGGanttGenerator(width=900, height=350)
-    gantt2.set_title("System Monitoring Tasks", "Priority-based task execution")
-    
-    tasks2 = [
-        Task("Alert System", 0, 60, priority="critical"),
-        Task("CPU Monitor", 0, 60, priority="high"),
-        Task("Memory Scanner", 5, 50, priority="medium"),
-        Task("Network Traffic", 0, 60, priority="low"),
-        Task("Security Scan", 20, 25, priority="high"),
-        Task("Log Rotation", 30, 10, priority="low"),
-        Task("Backup Process", 35, 20, priority="medium"),
-        Task("Health Check", 45, 15, priority="high")
-    ]
-    
-    for task in tasks2:
-        gantt2.add_task(task)
-    
-    gantt2.add_milestone(30, "Checkpoint")
-    gantt2.add_milestone(60, "Complete")
-    
-    gantt2.save_svg("priority_scheduling.svg")
-    gantt2.save_html("priority_scheduling.html")
-    
-    # Example 3: Sub-second precision
-    print("\n3. Creating high-precision timing chart...")
-    gantt3 = SVGGanttGenerator(width=800, height=280)
-    gantt3.set_title("Microsecond Precision Operations")
-    
-    tasks3 = [
-        Task("Init Process", 0.0, 2.5, "#ff9ff3"),
-        Task("Load Data", 1.8, 3.2, "#54a0ff"),
-        Task("Process Batch 1", 4.5, 1.8, "#5f27cd"),
-        Task("Process Batch 2", 6.0, 2.1, "#00d2d3"),
-        Task("Cleanup", 8.5, 0.7, "#ff6348")
-    ]
-    
-    for task in tasks3:
-        gantt3.add_task(task)
-    
-    gantt3.add_dependency(("Init Process", "end"), ("Load Data", "start"))
-    gantt3.add_dependency(("Load Data", "end"), ("Process Batch 1", "start"))
-    
-    gantt3.save_svg("precision_timing.svg")
-    gantt3.save_html("precision_timing.html")
-    
-    # Example 4: Get SVG as string (useful for web applications)
-    print("\n4. Getting SVG content as string...")
-    svg_string = gantt1.get_svg_string()
-    print(f"SVG string length: {len(svg_string)} characters")
-    print("First 200 characters:")
-    print(svg_string[:200] + "...")
-    
-    print("\n" + "=" * 45)
-    print("Examples completed! Files generated:")
-    print("SVG files:")
-    print("- basic_pipeline.svg")
-    print("- priority_scheduling.svg") 
-    print("- precision_timing.svg")
-    print("\nHTML files:")
-    print("- basic_pipeline.html")
-    print("- priority_scheduling.html")
-    print("- precision_timing.html")
-    print("\nThe save_svg() method saves pure SVG files,")
-    print("while save_html() creates complete HTML documents.")
-    print("Use get_svg_string() to get SVG content programmatically.")
-
-
-def quick_example():
-    """Quick example showing the most common usage pattern."""
-    print("\n" + "=" * 30)
-    print("QUICK EXAMPLE - Common Usage")
-    print("=" * 30)
-    
-    # Create a simple Gantt chart
-    gantt = SVGGanttGenerator()
-    gantt.set_title("Quick Example", "Simple 3-task workflow")
-    
-    # Add some tasks
-    gantt.add_task(Task("Setup", 0, 10, "#e74c3c"))
-    gantt.add_task(Task("Processing", 8, 25, "#3498db"))  
-    gantt.add_task(Task("Cleanup", 30, 5, "#2ecc71"))
-    
-    # Save in different formats
-    gantt.save_svg("quick_example.svg")        # Pure SVG
-    gantt.save_html("quick_example.html")      # HTML with styling
-    
-    # Or get the SVG content as string
-    svg_content = gantt.get_svg_string()
-    print(f"Generated SVG with {len(svg_content)} characters")
-    
-    return gantt
-
-
 if __name__ == "__main__":
-    print("SVG Gantt Chart Generator")
-    print("=" * 40)
-    print("Features:")
-    print("- save_svg(): Save as pure SVG file")
-    print("- save_html(): Save as styled HTML document") 
-    print("- get_svg_string(): Get SVG content as string")
-    print("- Seconds-based timing with sub-second precision")
-    print("- Priority levels and custom colors")
-    print("- Dependencies and milestones")
-    print("- No external dependencies required")
-    print()
-    
-    # Run demonstrations
-    demo_and_run_examples()
-    quick_example()
-    
-    print("\n" + "=" * 40)
-    print("Class ready for use! Key methods:")
-    print("  gantt = SVGGanttGenerator()")
-    print("  gantt.add_task(Task('name', start, duration, color))")
-    print("  gantt.save_svg('filename.svg')  # Pure SVG")
-    print("  gantt.save_html('filename.html')  # Styled HTML")
-    print("  svg_content = gantt.get_svg_string()  # Get string")
+
+    # Load the JSON file
+    with open("graph_20250627_142226.json", "r") as file:
+        data = json.load(file)
+
+    from fork_manager import ForkManager
+
+    gantt = ForkManager.generate_gantt_chart(data)
+
+    # Save the Gantt chart as an SVG file
+    gantt.save_svg("gantt_chart.svg")
+
+    pass

@@ -9,6 +9,7 @@ import concurrent.futures
 
 from vllm_like import LLM, SamplingParams
 from utils import suppress_tqdm
+from svg_gantt_generator import SVGGanttGenerator, Task
 
 
 TOOLS = [
@@ -502,10 +503,9 @@ class ForkManager:
                         unfinished_tids.remove(tid)
             time.sleep(1.0)
 
-    def save_thread_records(self, filename_wo_ext: str) -> None:
-        # save thread records as a JSON file without the future objects
+    def get_thread_records(self) -> dict[str, dict[str, Any]]:
         with self.thread_records_lock:
-            records_to_save = {
+            records_json = {
                 tid: {
                     "parent_tid": record["parent_tid"],
                     "child_tids": record["child_tids"],
@@ -515,65 +515,56 @@ class ForkManager:
                 }
                 for tid, record in self.thread_records.items()
             }
-            with open(f"{filename_wo_ext}.json", 'w') as f:
-                json.dump(records_to_save, f, indent=4)
+        return records_json
 
-        # # save thread records as a dot graph file
-        # with self.thread_records_lock:
-        #     with open(f"{filename_wo_ext}.dot", 'w') as f:
-        #         f.write("digraph G {\n")
-        #         for tid, record in self.thread_records.items():
-        #             parent_tid = record['parent_tid']
-        #             if parent_tid is not None:
-        #                 f.write(f'    "{parent_tid}" -> "{tid}";\n')
-        #         f.write("}\n")
-        
-        # # render this dot file to a PNG image using graphviz
-        # try:
-        #     import graphviz
-        #     dot = graphviz.Source.from_file(f"{filename_wo_ext}.dot")
-        #     dot.format = 'png'
-        #     dot.render(filename_wo_ext, cleanup=True)
-        #     print(f"Graph saved as {filename_wo_ext}.png")
-        # except Exception as e:
-        #     print(f"Error rendering graph: {e}")
+    def save_thread_records(self, filename_wo_ext: str) -> None:
+        records_json = self.get_thread_records()
+        with open(f"{filename_wo_ext}.json", 'w') as f:
+            json.dump(records_json, f, indent=4)
 
-        # use the class SVGGanttGenerator to generate the gantt chart
-
-        self.generate_gantt_chart(filename_wo_ext)
-
-    def generate_gantt_chart(self, filename_wo_ext: str) -> None:
-        from svg_gantt_generator import SVGGanttGenerator, Task
-        gantt = SVGGanttGenerator()
-        gantt.set_title("Thread Execution Gantt Chart", "Visualization of thread execution timelines.")
-
-        with self.thread_records_lock:
-            very_start_time = None
-            for tid, record in self.thread_records.items():
-                start_time = record["start_time"]
-                if very_start_time is None or start_time < very_start_time:
-                    very_start_time = start_time
-            if very_start_time is not None:
-                for tid, record in self.thread_records.items():
-                    start_time = record["start_time"]
-                    end_time = record["end_time"]
-                    if end_time is None:
-                        duration = 1.0  # Default duration if end_time is not set
-                    else:
-                        duration = end_time - start_time
-                    relative_start_time = start_time - very_start_time
-                    gantt.add_task(Task(name=f"Thread {tid}",
-                                        start_time=relative_start_time,
-                                        duration=duration))
-            
-            # add dependencies
-            for tid, record in self.thread_records.items():
-                for child_tid in record['child_tids']:
-                    gantt.add_dependency((f"Thread {tid}", None), (f"Thread {child_tid}", "start"))
-                    gantt.add_dependency((f"Thread {child_tid}", "end"), (f"Thread {tid}", None))
+        gantt = self.generate_gantt_chart(records_json)
 
         gantt.save_svg(f"{filename_wo_ext}.svg")
         print(f"Gantt chart saved as {filename_wo_ext}.svg")
+
+    @staticmethod
+    def generate_gantt_chart(records_json: dict[str, dict[str, Any]]) -> SVGGanttGenerator:
+        gantt = SVGGanttGenerator()
+        gantt.set_title("Thread Execution Gantt Chart", "Visualization of thread execution timelines.")
+
+        colormap = [
+            "#ff6b6b", "#4ecdc4", "#ffa500", "#8a2be2", "#00ff7f",
+        ]
+
+        very_start_time = None
+        for tid, record in records_json.items():
+            start_time = record["start_time"]
+            if very_start_time is None or start_time < very_start_time:
+                very_start_time = start_time
+        if very_start_time is not None:
+            for tid, record in records_json.items():
+                start_time = record["start_time"]
+                end_time = record["end_time"]
+                if end_time is None:
+                    duration = 1.0  # Default duration if end_time is not set
+                else:
+                    duration = end_time - start_time
+                relative_start_time = start_time - very_start_time
+                color = colormap[record["level"] % len(colormap)]
+                gantt.add_task(Task(name=f"Thread {tid}",
+                                    start_time=relative_start_time,
+                                    duration=duration,
+                                    color=color,
+                                    description=f"Level {record['level']}",
+                                    ))
+        
+        # add dependencies
+        for tid, record in records_json.items():
+            for child_tid in record['child_tids']:
+                gantt.add_dependency((f"Thread {tid}", None), (f"Thread {child_tid}", "start"))
+                gantt.add_dependency((f"Thread {child_tid}", "end"), (f"Thread {tid}", None))
+
+        return gantt
 
     def run_entry(self, messages):
         safety_gap = 2.0
