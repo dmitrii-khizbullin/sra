@@ -206,7 +206,7 @@ class ForkManager:
         self.llm = llm
         self.tools = tools
 
-        self.max_tokens = 1000
+        self.max_tokens = 200
 
         self.sampling_params = SamplingParams(max_tokens=self.max_tokens, temperature=0.0)
 
@@ -221,9 +221,9 @@ class ForkManager:
         self.tcid_length = 2 # Tool Call ID, chars
         self.mid_length = 4 # Message ID, chars
 
-        self.max_turns = 10
+        self.max_turns = 5
 
-        self.max_forking_level = 3
+        self.max_forking_level = 2
 
     def fork(
         self,
@@ -273,6 +273,7 @@ class ForkManager:
                 future = self.thread_records[tid]['future']
                 if future is not None:
                     result = future.result()
+                    self.thread_records[tid]['end_time'] = time.time()
                     results.append(f"Thread {tid} result:\n\n {result}")
                 else:
                     raise ValueError(f"Thread {tid} has no future associated with it.")
@@ -351,16 +352,18 @@ class ForkManager:
                     tools: list[dict[str, Any]],
                     ) -> str:
         new_tid = generate_random_id(self.tid_length)
-        future = self.thread_pool.submit(
-            self.run_agent, new_tid, messages, tools
-        )
         with self.thread_records_lock:
+            future = self.thread_pool.submit(
+                self.run_agent, new_tid, messages, tools
+            )
             self.thread_records[parent_tid]['child_tids'].append(new_tid)
             self.thread_records[new_tid] = {
                 "future": future,
                 "parent_tid": parent_tid,
                 "child_tids": [],
                 "level": self.thread_records[parent_tid]['level'] + 1,
+                "start_time": time.time(),
+                "end_time": None,  # Will be set when the future is done
             }
         return new_tid
 
@@ -488,6 +491,7 @@ class ForkManager:
                         future: concurrent.futures.Future = record['future']
                         try:
                             future.result(timeout=0.001)
+                            record['end_time'] = time.time()
                             print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
                             unfinished_tids.remove(tid)
                         except concurrent.futures.TimeoutError:
@@ -511,25 +515,63 @@ class ForkManager:
             with open(f"{filename_wo_ext}.json", 'w') as f:
                 json.dump(records_to_save, f, indent=4)
 
-        # save thread records as a dot graph file
-        with self.thread_records_lock:
-            with open(f"{filename_wo_ext}.dot", 'w') as f:
-                f.write("digraph G {\n")
-                for tid, record in self.thread_records.items():
-                    parent_tid = record['parent_tid']
-                    if parent_tid is not None:
-                        f.write(f'    "{parent_tid}" -> "{tid}";\n')
-                f.write("}\n")
+        # # save thread records as a dot graph file
+        # with self.thread_records_lock:
+        #     with open(f"{filename_wo_ext}.dot", 'w') as f:
+        #         f.write("digraph G {\n")
+        #         for tid, record in self.thread_records.items():
+        #             parent_tid = record['parent_tid']
+        #             if parent_tid is not None:
+        #                 f.write(f'    "{parent_tid}" -> "{tid}";\n')
+        #         f.write("}\n")
         
-        # render this dot file to a PNG image using graphviz
-        try:
-            import graphviz
-            dot = graphviz.Source.from_file(f"{filename_wo_ext}.dot")
-            dot.format = 'png'
-            dot.render(filename_wo_ext, cleanup=True)
-            print(f"Graph saved as {filename_wo_ext}.png")
-        except Exception as e:
-            print(f"Error rendering graph: {e}")
+        # # render this dot file to a PNG image using graphviz
+        # try:
+        #     import graphviz
+        #     dot = graphviz.Source.from_file(f"{filename_wo_ext}.dot")
+        #     dot.format = 'png'
+        #     dot.render(filename_wo_ext, cleanup=True)
+        #     print(f"Graph saved as {filename_wo_ext}.png")
+        # except Exception as e:
+        #     print(f"Error rendering graph: {e}")
+
+        # use the class SVGGanttGenerator to generate the gantt chart
+
+        self.generate_gantt_chart(filename_wo_ext)
+
+    def generate_gantt_chart(self, filename_wo_ext: str) -> None:
+        from svg_gantt_generator import SVGGanttGenerator, Task
+        gantt = SVGGanttGenerator()
+        gantt.set_title("Thread Execution Gantt Chart", "Visualization of thread execution timelines.")
+
+        with self.thread_records_lock:
+            very_start_time = None
+            for tid, record in self.thread_records.items():
+                start_time = record["start_time"]
+                if very_start_time is None or start_time < very_start_time:
+                    very_start_time = start_time
+            if very_start_time is not None:
+                for tid, record in self.thread_records.items():
+                    start_time = record["start_time"]
+                    end_time = record["end_time"]
+                    if end_time is None:
+                        duration = 1.0  # Default duration if end_time is not set
+                    else:
+                        duration = end_time - start_time
+                    relative_start_time = start_time - very_start_time
+                    gantt.add_task(Task(name=f"Thread {tid}",
+                                        start_time=relative_start_time,
+                                        duration=duration))
+            
+            # add dependencies
+            for tid, record in self.thread_records.items():
+                for child_tid in record['child_tids']:
+                    gantt.add_dependency(f"Thread {tid}", f"Thread {child_tid}")
+                # if record['parent_tid'] is not None:
+                #     gantt.add_dependency(record['parent_tid'], tid)
+
+        gantt.save_svg(f"{filename_wo_ext}.svg")
+        print(f"Gantt chart saved as {filename_wo_ext}.svg")
 
     def run_entry(self, messages):
         safety_gap = 2.0
@@ -557,8 +599,13 @@ class ForkManager:
             "parent_tid": None,
             "child_tids": [],
             "level": 0,
+            "start_time": time.time(),
+            "end_time": None,  # Will be set when the future is done
         }
         whatever = self.run_agent(new_tid, messages, self.tools) # start with all tools
+
+        with self.thread_records_lock:
+            self.thread_records[new_tid]['end_time'] = time.time()
 
         self.join_all_threads()
 
