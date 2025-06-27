@@ -274,8 +274,11 @@ class ForkManager:
                 future = self.thread_records[tid]['future']
                 if future is not None:
                     result = future.result()
-                    self.thread_records[tid]['end_time'] = time.time()
-                    results.append(f"Thread {tid} result:\n\n {result}")
+                    with self.thread_records_lock:
+                        self.thread_records[tid]['start_time'] = result['start_time']
+                        self.thread_records[tid]['end_time'] = result['end_time']
+                        self.thread_records[tid]['join_time'] = time.time()
+                    results.append(f"Thread {tid} result:\n\n {result['result']}")
                 else:
                     raise ValueError(f"Thread {tid} has no future associated with it.")
             else:
@@ -298,10 +301,11 @@ class ForkManager:
                     if future.done():
                         status = "Finished"
                         future_result = future.result()
-                        if future_result is not None:
+                        result_str = future_result['result']
+                        if result_str is not None:
                             status = "Finished"
-                            if isinstance(future_result, str):
-                                result = f"Text of length {len(future_result)}"
+                            if isinstance(result_str, str):
+                                result = f"Text of length {len(result_str)}"
                             else:
                                 raise ValueError(f"Unexpected result type: {type(future_result)}")
                         else:
@@ -363,8 +367,10 @@ class ForkManager:
                 "parent_tid": parent_tid,
                 "child_tids": [],
                 "level": self.thread_records[parent_tid]['level'] + 1,
-                "start_time": time.time(),
+                "fork_time": time.time(),
+                "start_time": None,  # Will be set when the future is started
                 "end_time": None,  # Will be set when the future is done
+                "join_time": None,  # Will be set when the future is joined
             }
         return new_tid
 
@@ -423,7 +429,9 @@ class ForkManager:
                   my_tid: str,
                   messages: list[dict[str, Any]],
                   tools: list[dict[str, Any]],
-                  ) -> str | None:
+                  ) -> dict[str, str | None | float]:
+
+        start_time = time.time()
 
         result_str: str | None = None
         for i in range(self.max_turns):
@@ -478,7 +486,11 @@ class ForkManager:
                     "tool_call_id": tool_call['id'],
                 }
                 messages.append(tool_answer_message)
-        return result_str
+
+        end_time = time.time()
+
+        result = dict(result=result_str, start_time=start_time, end_time=end_time)
+        return result
 
     def join_all_threads(self) -> None:
         with self.thread_records_lock:
@@ -491,9 +503,10 @@ class ForkManager:
                     if record['future'] is not None:
                         future: concurrent.futures.Future = record['future']
                         try:
-                            future.result(timeout=0.001)
-                            if record['end_time'] is None:
-                                record['end_time'] = time.time()
+                            result = future.result(timeout=0.001)
+                            record['start_time'] = result['start_time']
+                            record['end_time'] = result['end_time']
+                            record['join_time'] = time.time()
                             print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
                             unfinished_tids.remove(tid)
                         except concurrent.futures.TimeoutError:
@@ -510,8 +523,10 @@ class ForkManager:
                     "parent_tid": record["parent_tid"],
                     "child_tids": record["child_tids"],
                     "level": record["level"],
+                    "fork_time": record["fork_time"],
                     "start_time": record["start_time"],
                     "end_time": record["end_time"],
+                    "join_time": record["join_time"],
                 }
                 for tid, record in self.thread_records.items()
             }
@@ -592,20 +607,24 @@ class ForkManager:
             "parent_tid": None,
             "child_tids": [],
             "level": 0,
-            "start_time": time.time(),
+            "fork_time": time.time(),
+            "start_time": None,  # Will be set when the future is started
             "end_time": None,  # Will be set when the future is done
+            "join_time": None,  # Will be set when the future is joined
         }
-        whatever = self.run_agent(new_tid, messages, self.tools) # start with all tools
+        result = self.run_agent(new_tid, messages, self.tools) # start with all tools
 
         with self.thread_records_lock:
-            self.thread_records[new_tid]['end_time'] = time.time()
+            self.thread_records[new_tid]['start_time'] = result['start_time']
+            self.thread_records[new_tid]['end_time'] = result['end_time']
+            self.thread_records[new_tid]['join_time'] = time.time()
 
         self.join_all_threads()
 
         name_with_datetime = "graph_" + time.strftime("%Y%m%d_%H%M%S")
         self.save_thread_records(name_with_datetime)
 
-        return whatever
+        return result['result']
 
 
 if __name__ == "__main__":
