@@ -15,6 +15,8 @@ from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+# (Task name, Bar End spec), Bar end: start, end, None (the same time stamp as another task spec)
+TaskEndSpec = tuple[str, str | None]
 
 @dataclass
 class Task:
@@ -87,7 +89,7 @@ class SVGGanttGenerator:
         
         self.tasks: List[Task] = []
         self.resources: Dict[str, Resource] = {}
-        self.dependencies: List[Tuple[str, str]] = []  # (from_task, to_task)
+        self.dependencies: List[Tuple[TaskEndSpec, TaskEndSpec]] = []  # (from_task, to_task)
         self.milestones: List[Tuple[float, str]] = []  # (time, label)
         
         # Chart dimensions
@@ -123,8 +125,8 @@ class SVGGanttGenerator:
     def add_resource(self, resource: Resource) -> None:
         """Add a resource to the chart."""
         self.resources[resource.name] = resource
-    
-    def add_dependency(self, from_task: str, to_task: str) -> None:
+
+    def add_dependency(self, from_task: TaskEndSpec, to_task: TaskEndSpec) -> None:
         """Add a dependency between two tasks."""
         self.dependencies.append((from_task, to_task))
     
@@ -360,7 +362,11 @@ class SVGGanttGenerator:
         # Task name to index mapping
         task_map = {task.name: i for i, task in enumerate(self.tasks)}
         
-        for from_task, to_task in self.dependencies:
+        for (from_task, from_end), (to_task, to_end) in self.dependencies:
+            if from_end is None and to_end is None:
+                print(f"Warning: Both ends of dependency from '{from_task}' to '{to_task}' are None. Skipping.")
+                continue
+
             if from_task in task_map and to_task in task_map:
                 from_idx = task_map[from_task]
                 to_idx = task_map[to_task]
@@ -369,10 +375,20 @@ class SVGGanttGenerator:
                 to_task_obj = self.tasks[to_idx]
                 
                 # Calculate positions
-                from_x = self._time_to_x(from_task_obj.end_time)
+                from_time = (from_task_obj.end_time if from_end == "end" else
+                             from_task_obj.start_time if from_end == "start" else None)
+                to_time = (to_task_obj.start_time if to_end == "start" else
+                                to_task_obj.end_time if to_end == "end" else None)
+                if from_time is None:
+                    from_time = to_time
+                if to_time is None:
+                    to_time = from_time
+                if from_time is None or to_time is None:
+                    raise ValueError(f"Invalid dependency times for '{from_task}' to '{to_task}'")
+                from_x = self._time_to_x(from_time)
                 from_y = self.margin_top + from_idx * self.row_height + 22
                 
-                to_x = self._time_to_x(to_task_obj.start_time)
+                to_x = self._time_to_x(to_time)
                 to_y = self.margin_top + to_idx * self.row_height + 22
                 
                 # Draw dependency line
@@ -598,9 +614,9 @@ def demo_sub_second_precision():
         gantt.add_task(task)
     
     # Add dependencies
-    gantt.add_dependency("Init Process", "Load Data")
-    gantt.add_dependency("Load Data", "Process Batch 1")
-    gantt.add_dependency("Process Batch 1", "Process Batch 2")
+    gantt.add_dependency(("Init Process", "end"), ("Load Data", "start"))
+    gantt.add_dependency(("Load Data", "end"), ("Process Batch 1", "start"))
+    gantt.add_dependency(("Process Batch 1", "end"), ("Process Batch 2", "start"))
     
     gantt.save_html("demo_precision.html")
     return gantt
@@ -670,8 +686,8 @@ def demo_and_run_examples():
     for task in tasks3:
         gantt3.add_task(task)
     
-    gantt3.add_dependency("Init Process", "Load Data")
-    gantt3.add_dependency("Load Data", "Process Batch 1")
+    gantt3.add_dependency(("Init Process", "end"), ("Load Data", "start"))
+    gantt3.add_dependency(("Load Data", "end"), ("Process Batch 1", "start"))
     
     gantt3.save_svg("precision_timing.svg")
     gantt3.save_html("precision_timing.html")

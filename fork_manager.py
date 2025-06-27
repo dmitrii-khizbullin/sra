@@ -206,7 +206,7 @@ class ForkManager:
         self.llm = llm
         self.tools = tools
 
-        self.max_tokens = 200
+        self.max_tokens = 1000
 
         self.sampling_params = SamplingParams(max_tokens=self.max_tokens, temperature=0.0)
 
@@ -221,7 +221,7 @@ class ForkManager:
         self.tcid_length = 2 # Tool Call ID, chars
         self.mid_length = 4 # Message ID, chars
 
-        self.max_turns = 5
+        self.max_turns = 10
 
         self.max_forking_level = 2
 
@@ -491,7 +491,8 @@ class ForkManager:
                         future: concurrent.futures.Future = record['future']
                         try:
                             future.result(timeout=0.001)
-                            record['end_time'] = time.time()
+                            if record['end_time'] is None:
+                                record['end_time'] = time.time()
                             print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
                             unfinished_tids.remove(tid)
                         except concurrent.futures.TimeoutError:
@@ -509,6 +510,8 @@ class ForkManager:
                     "parent_tid": record["parent_tid"],
                     "child_tids": record["child_tids"],
                     "level": record["level"],
+                    "start_time": record["start_time"],
+                    "end_time": record["end_time"],
                 }
                 for tid, record in self.thread_records.items()
             }
@@ -566,9 +569,8 @@ class ForkManager:
             # add dependencies
             for tid, record in self.thread_records.items():
                 for child_tid in record['child_tids']:
-                    gantt.add_dependency(f"Thread {tid}", f"Thread {child_tid}")
-                # if record['parent_tid'] is not None:
-                #     gantt.add_dependency(record['parent_tid'], tid)
+                    gantt.add_dependency((f"Thread {tid}", None), (f"Thread {child_tid}", "start"))
+                    gantt.add_dependency((f"Thread {child_tid}", "end"), (f"Thread {tid}", None))
 
         gantt.save_svg(f"{filename_wo_ext}.svg")
         print(f"Gantt chart saved as {filename_wo_ext}.svg")
