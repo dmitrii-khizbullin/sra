@@ -7,9 +7,10 @@ import random
 import re
 import concurrent.futures
 
-from .vllm_like import LLM, SamplingParams
-from .utils import suppress_tqdm
-from .svg_gantt_generator import SVGGanttGenerator, Task
+from agents.generate_gantt_chart import generate_gantt_chart
+
+from agents.vllm_like import LLM, SamplingParams
+from agents.utils import suppress_tqdm
 
 
 TOOLS = [
@@ -202,9 +203,11 @@ def remove_forking_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class ForkManager:
     def __init__(self, 
                  llm: LLM,
-                 extra_tools: list[dict[str, Any]] | None,
+                 extra_tools: list[dict[str, Any]] | None = None,
+                 artifact_dir: str | None = None,
                  ):
         self.llm = llm
+        self.artifact_dir = artifact_dir
 
         self.tools = TOOLS + (extra_tools if extra_tools is not None else [])
 
@@ -542,68 +545,20 @@ class ForkManager:
         return records_json
 
     def save_thread_records(self, filename_wo_ext: str) -> None:
-        records_json = self.get_thread_records()
-        with open(f"{filename_wo_ext}.json", 'w') as f:
-            json.dump(records_json, f, indent=4)
+        if self.artifact_dir is not None:
+            records_json = self.get_thread_records()
+            json_path = f"{self.artifact_dir}/{filename_wo_ext}.json"
+            print(f"Saving thread records to {json_path}")
+            with open(json_path, 'w') as f:
+                json.dump(records_json, f, indent=4)
 
-        gantt = self.generate_gantt_chart(records_json)
+            gantt = generate_gantt_chart(records_json)
 
-        gantt.save_svg(f"{filename_wo_ext}.svg")
-        print(f"Gantt chart saved as {filename_wo_ext}.svg")
+            svg_path = f"{self.artifact_dir}/{filename_wo_ext}.svg"
+            gantt.save_svg(svg_path)
+            print(f"Gantt chart saved as {svg_path}")
 
-    @staticmethod
-    def generate_gantt_chart(records_json: dict[str, dict[str, Any]]) -> SVGGanttGenerator:
-        gantt = SVGGanttGenerator()
-        gantt.set_title("Thread Execution Gantt Chart", "Visualization of thread execution timelines.")
-
-        colormap = [
-            "#ff6b6b", "#4ecdc4", "#ffa500", "#8a2be2", "#00ff7f",
-        ]
-
-        time_zero = None
-        for tid, record in records_json.items():
-            fork_time = record["fork_time"]
-            if time_zero is None or fork_time < time_zero:
-                time_zero = fork_time
-        if time_zero is not None:
-            for tid, record in records_json.items():
-                start_time = record["start_time"]
-                if start_time is None:
-                    start_time = record["fork_time"]
-                    end_time = record["fork_time"] + 0.1
-                end_time = record["end_time"]
-                if end_time is None:
-                    duration = 1.0  # Default duration if end_time is not set
-                else:
-                    duration = end_time - start_time
-                relative_start_time = start_time - time_zero
-                color = colormap[record["level"] % len(colormap)]
-                gantt.add_task(Task(name=f"Thread {tid}",
-                                    start_time=relative_start_time,
-                                    duration=duration,
-                                    color=color,
-                                    description=f"Level {record['level']}",
-                                    ))
-        
-        # add dependencies
-        for tid, record in records_json.items():
-            for child_tid in record['child_tids']:
-                child_record = records_json[child_tid]
-                fork_time = child_record['fork_time'] - time_zero
-                if child_record['start_time'] is None:
-                    gantt.add_dependency((f"Thread {tid}", fork_time), (f"Thread {child_tid}", fork_time))
-                    continue
-                start_time = child_record['start_time'] - time_zero
-                gantt.add_dependency((f"Thread {tid}", fork_time), (f"Thread {child_tid}", start_time))
-                if child_record['end_time'] is None or child_record['join_time'] is None:
-                    continue
-                end_time = child_record['end_time'] - time_zero
-                join_time = child_record['join_time'] - time_zero
-                gantt.add_dependency((f"Thread {child_tid}", end_time), (f"Thread {tid}", join_time))
-
-        return gantt
-
-    def run_entry(self, task: str) -> str:
+    def run_entry(self, task: str) -> str | None:
         safety_gap = 2.0
         max_words = self.max_tokens // 2 // safety_gap # Rough estimate of words based on tokens
 
@@ -646,7 +601,7 @@ class ForkManager:
         name_with_datetime = "graph_" + time.strftime("%Y%m%d_%H%M%S")
         self.save_thread_records(name_with_datetime)
 
-        result_str = cast(str, result['result'])
+        result_str = cast(str | None, result['result'])
         return result_str
 
 
@@ -670,7 +625,7 @@ def main():
     # ===============================================
 
     task = f"Solve the following problem with 5 different methods:\n\n {problem}"
-    fork_manager = ForkManager(llm, TOOLS)
+    fork_manager = ForkManager(llm, artifact_dir=".")
     response = fork_manager.run_entry(task)
     print(response)
 

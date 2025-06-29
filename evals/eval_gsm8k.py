@@ -1,3 +1,4 @@
+import os
 
 from datetime import datetime
 from typing import Type, cast
@@ -21,8 +22,8 @@ def main():
                         help="Names of agents to evaluate. Provide a space-separated list, "
                         "e.g., --agent_names BaselineAgent SelfReplicatingAgent. "
                         "If None, evaluate all available agents.")
-    parser.add_argument("--max_vllm_concurrency", type=int, default=None,
-                        help="Maximum concurrency for vLLM calls. If None, use default concurrency.")
+    parser.add_argument("--max_concurrent_tasks", type=int, default=None,
+                        help="Maximum concurrency for dataset tasks. If None, use default concurrency.")
     args = parser.parse_args()
 
     available_agent_classes: list[Type[AgentBase]] = [
@@ -35,7 +36,7 @@ def main():
     agent_names = args.agent_names
     agent_classes = [agent_class_dict[name] for name in agent_names] if agent_names else available_agent_classes
 
-    extra_kwargs = dict(max_vllm_concurrency=args.max_vllm_concurrency) if args.max_vllm_concurrency is not None else {}
+    extra_kwargs = dict(max_concurrent_tasks=args.max_concurrent_tasks) if args.max_concurrent_tasks is not None else {}
 
     evaluator = Gsm8kEvaluator(num_examples=args.num_examples, n_repeats=args.n_repeats, split=args.split, **extra_kwargs)
 
@@ -45,21 +46,16 @@ def main():
     exp_folder = f"{runs_folder}/{exp_datetime}/{dataset_name}"
 
     for agent_class in agent_classes:
-        agent = agent_class(extra_tools=None) # no extra tools for GSM8K
-        print(f"Evaluating {agent_class.__name__} on GSM8K dataset...")
-        result = evaluator(agent)
-        print(f"Results for {agent_class.__name__}:")
-        print(result)
-
-        # score: float | None  # top-line metric
-        # metrics: dict[str, float] | None  # other metrics
-        # htmls: list[str]  # strings of valid HTML
-        # convos: list[MessageList]  # sampled conversations        
-
         agent_name = agent_class.__name__
         result_folder = f"{exp_folder}/{agent_name}"
-        import os
         os.makedirs(result_folder, exist_ok=True)
+
+        print(f"Evaluating {agent_class.__name__} on GSM8K dataset...")
+        # no extra tools for GSM8K
+        result = evaluator(agent_factory=lambda: agent_class(extra_tools=None, artifact_dir=result_folder))
+        print(f"Results for {agent_class.__name__}:")
+        print(result)     
+
         with open(f"{result_folder}/result.txt", "w") as f:
             f.write(f"Score: {result.score}\n")
             f.write(f"Metrics: {result.metrics}\n")

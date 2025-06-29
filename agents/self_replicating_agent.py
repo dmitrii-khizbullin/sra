@@ -1,14 +1,15 @@
 from typing import Any
 
-from .vllm_like import LLM
-from .agent_base import AgentBase, AgentResult, MessageList
-from .fork_manager import ForkManager
+from agents.vllm_like import LLM
+from agents.agent_base import AgentBase, AgentResult, MessageList
+from agents.fork_manager import ForkManager
 
 
 class SelfReplicatingAgent(AgentBase):
     def __init__(self,
                  port: int = 8000,
                  extra_tools: list[dict[str, Any]] | None = None,
+                 artifact_dir: str | None = None,
                  **kwargs
                  ) -> None:
         """ Supports only vLLM server running on localhost:port/v1 """
@@ -17,7 +18,7 @@ class SelfReplicatingAgent(AgentBase):
         self.extra_tools = extra_tools # not used so far
         base_url = f"http://localhost:{port}/v1"
         self.llm = LLM(base_url=base_url)
-        self.fork_manager = ForkManager(self.llm, extra_tools)
+        self.fork_manager = ForkManager(self.llm, extra_tools, artifact_dir=artifact_dir)
 
     def __call__(self, message_list: MessageList) -> AgentResult:
 
@@ -29,6 +30,8 @@ class SelfReplicatingAgent(AgentBase):
                 raise ValueError(f"Unknown role in message: {message['role']}")
 
         response_str = self.fork_manager.run_entry(flattened_messages)
+        if response_str is None:
+            response_str = ""
 
         agent_result = AgentResult(
             response=response_str,

@@ -1,7 +1,7 @@
 from typing import Any
 
-from .vllm_like import LLM, SamplingParams
-from .agent_base import AgentBase, AgentResult, MessageList
+from agents.vllm_like import LLM, SamplingParams
+from agents.agent_base import AgentBase, AgentResult, MessageList
 
 
 class BaselineAgent(AgentBase):
