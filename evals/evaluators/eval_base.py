@@ -9,5 +9,5 @@ class EvalBase:
     Base class for defining an evaluation.
     """
 
-    def __call__(self, agent_factory: Callable[[], AgentBase]) -> EvalResult:
+    def __call__(self, agent_factory: Callable[[str], AgentBase]) -> EvalResult:
         raise NotImplementedError

@@ -1,4 +1,6 @@
+from dataclasses import dataclass
 import json
+import os
 import threading
 import time
 from typing import Any, cast
@@ -6,6 +8,7 @@ import string
 import random
 import re
 import concurrent.futures
+from openai.types.chat import ChatCompletionMessageToolCall
 
 from agents.generate_gantt_chart import generate_gantt_chart
 
@@ -87,7 +90,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Finishes the agent or the forked agent operation when the result is ready.",
+            "description": ("Finishes the agent or the forked agent operation when the result is ready. "
+                            "If the parent LLM thread (or the user) asked you to return the results in "
+                            "some specific format, remember to do so."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -102,7 +107,7 @@ TOOLS = [
                     },
                     "message": {
                         "type": "string",
-                        "description": "The message to the caller agent",
+                        "description": "The message to the caller LLM thread or the user",
                     },
                 },
                 "required": [],
@@ -127,13 +132,21 @@ You must explicitly provide the forked agent with the list of Message IDs (MIDs)
 You can also use the status tool to get the status of all threads launched by this thread. You can thus check if one of the LLM threads you launched is already finished, you can join it and leave the others running.
 When you are done with the task, you MUST use the finish tool to return the results of your operation.
 Remember that if you do not use the finish tool, nothing will be returned to the caller agent or the user.
-You MUST use the finish tool to return the results of your operation.
+ATTENTION: You MUST use the finish tool to return the results of your operation before you run out of turns.
 The user will be very disappointed if the answer/response is not returned to them. Make the user happy in this respect.
 You MUST use at least one tool in your response.
 Do not use thinking too much, rely more on using the tools to solve the problem and delegating subploblems.
 You as the main thread or any other thread will have {max_turns} turns to solve the problem.
 Every your response must be less than {max_words} words including tool call arguments.
 """
+
+
+@dataclass
+class ThreadResult:
+    result: str | None
+    start_time: float
+    end_time: float
+    message_history: list[dict[str, Any]]
 
 
 def generate_random_id(length: int) -> str:
@@ -170,6 +183,12 @@ def remove_tool_calls(response_text: str) -> str:
 
 
 def tag_message(message: dict[str, Any], mid_length: int) -> dict[str, Any]:
+    if "role" not in message:
+        return message
+    if "content" not in message:
+        return message
+    if message["content"] is None:
+        return message
     if message["role"] in ["system", "user", "assistant"]:
         message = message.copy()
         random_id = generate_random_id(mid_length)
@@ -213,7 +232,9 @@ class ForkManager:
 
         self.max_tokens = 1000
 
-        self.sampling_params = SamplingParams(max_tokens=self.max_tokens, temperature=0.0)
+        temperature = 0.5 # 0.0 does not recover from repeats
+
+        self.sampling_params = SamplingParams(max_tokens=self.max_tokens, temperature=temperature)
 
         self.tools_functions: set[str] = {"fork", "join", "status", "finish"}
 
@@ -268,7 +289,7 @@ class ForkManager:
         return f"Forked TID: {future_tid}"
 
     def join(self, my_tid: str, tids: list[str]) -> str:
-        results: list[str] = []
+        results: dict[str, str] = {}
         if my_tid not in self.thread_records:
             raise ValueError(f"Thread {my_tid} does not exist.")
         my_record = self.thread_records[my_tid]
@@ -277,20 +298,20 @@ class ForkManager:
                 future: concurrent.futures.Future
                 future = self.thread_records[tid]['future']
                 if future is not None:
-                    result = future.result()
+                    result: ThreadResult = future.result()
                     with self.thread_records_lock:
-                        self.thread_records[tid]['start_time'] = result['start_time']
-                        self.thread_records[tid]['end_time'] = result['end_time']
+                        self.thread_records[tid]['start_time'] = result.start_time
+                        self.thread_records[tid]['end_time'] = result.end_time
                         self.thread_records[tid]['join_time'] = time.time()
-                    results.append(f"Thread {tid} result:\n\n {result['result']}")
+                    results[tid] = f"Thread {tid} result:\n\n {result.result}"
                 else:
                     raise ValueError(f"Thread {tid} has no future associated with it.")
             else:
-                results.append(f"Thread {tid} does not exist or is not owned by this thread. Can't join it.")
+                results[tid] = f"Thread {tid} does not exist or is not owned by this thread. Can't join it."
         results_str = "Successfully joined threads.\n\n"
-        for result in results:
-            results_str += f"Thread {result}\n"
-            results_str += f"{result}\n\n"
+        for tid, message in results.items():
+            results_str += f"Thread {tid}\n"
+            results_str += f"{message}\n\n"
         return results_str
 
     def status(self, my_tid: str) -> str:
@@ -305,11 +326,11 @@ class ForkManager:
                     if future.done():
                         status = "Finished"
                         future_result = future.result()
-                        result_str = future_result['result']
+                        result_str = future_result.result
                         if result_str is not None:
                             status = "Finished"
                             if isinstance(result_str, str):
-                                result = f"Text of length {len(result_str)}"
+                                result = f"Text of length {len(result_str)} characters."
                             else:
                                 raise ValueError(f"Unexpected result type: {type(future_result)}")
                         else:
@@ -318,7 +339,7 @@ class ForkManager:
                         status = "Running"
                         result = "Not yet completed"
                     status = "Running" if not future.done() else "Finished"
-                    result = f"Text of length {len(future.result())}" if future.done() else "Not yet completed"
+                    result = f"Text of length {len(future.result())} characters." if future.done() else "Not yet completed"
                 else:
                     status = "Main thread"
                     result = "No result available"
@@ -432,14 +453,41 @@ class ForkManager:
         else:
             tool_answer = f"Tool {tool_name} does not exist."
         return tool_answer
+
+    @staticmethod
+    def tool_call_to_dict(tool_call: ChatCompletionMessageToolCall) -> dict[str, Any]:
+        return {
+            "id": tool_call.id,
+            "type": "function",
+            "function": {
+                "name": tool_call.function.name,
+                "arguments": json.loads(tool_call.function.arguments),
+            },
+        }
+
+    @staticmethod
+    def encode_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
+        # Encode the tool call to a format suitable for the LLM
+        return {
+            "id": tool_call["id"],
+            "type": tool_call["type"],
+            "function": {
+                "name": tool_call["function"]["name"],
+                "arguments": json.dumps(tool_call["function"]["arguments"]),
+            },
+        }
         
     def run_agent(self,
                   my_tid: str,
                   messages: list[dict[str, Any]],
                   tools: list[dict[str, Any]],
-                  ) -> dict[str, str | None | float]:
+                  ) -> ThreadResult:
 
         start_time = time.time()
+
+        chat_template_kwargs = {
+            "enable_thinking": False,
+        }
 
         result_str: str | None = None
         for i in range(self.max_turns):
@@ -451,14 +499,21 @@ class ForkManager:
                     sampling_params=self.sampling_params,
                     tools=tools,
                     )
-            output = outputs.choices[0].message.content
-            output = output if output is not None else ""
+            usage = outputs.usage
+            message = outputs.choices[0].message
+            tool_calls_api = message.tool_calls
+            output = message.content if message.content is not None else ""
             content = remove_tool_calls(output)
-            messages.append({"role": "assistant", "content": content})
-            tool_calls = extract_tool_calls(output)
+            tool_calls_extracted = extract_tool_calls(output)
+            tool_calls = [self.tool_call_to_dict(tc) for tc in tool_calls_api] \
+                if tool_calls_api is not None else tool_calls_extracted
             print(f"MyTID={my_tid}, Assistant: {content}, Tool calls: {tool_calls}")
             tool_answers = []
             is_finish = False
+            new_message = {"role": "assistant",
+                           "content": content,
+                           "tool_calls": [self.encode_tool_call(tc) for tc in tool_calls]}
+            messages.append(tag_message(new_message, mid_length=self.mid_length))
             for tool_call in tool_calls:
                 func = tool_call["function"]
                 tool_name = func["name"]
@@ -498,7 +553,12 @@ class ForkManager:
 
         end_time = time.time()
 
-        result = dict(result=result_str, start_time=start_time, end_time=end_time)
+        result = ThreadResult(
+            result=result_str,
+            start_time=start_time,
+            end_time=end_time,
+            message_history=messages
+        )
         return result
 
     def join_all_threads(self) -> None:
@@ -513,12 +573,8 @@ class ForkManager:
                         future: concurrent.futures.Future = record['future']
                         try:
                             result = future.result(timeout=0.001)
-                            record['start_time'] = result['start_time']
-                            record['end_time'] = result['end_time']
-                            # if record['join_time'] is None:
-                            #     record['join_time'] = time.time()
-                            # else:
-                            #     print(f"Thread {tid} already joined at {record['join_time']}.")
+                            record['start_time'] = result.start_time
+                            record['end_time'] = result.end_time
                             print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
                             unfinished_tids.remove(tid)
                         except concurrent.futures.TimeoutError:
@@ -546,6 +602,7 @@ class ForkManager:
 
     def save_thread_records(self, filename_wo_ext: str) -> None:
         if self.artifact_dir is not None:
+            os.makedirs(self.artifact_dir, exist_ok=True)
             records_json = self.get_thread_records()
             json_path = f"{self.artifact_dir}/{filename_wo_ext}.json"
             print(f"Saving thread records to {json_path}")
@@ -592,8 +649,8 @@ class ForkManager:
         result = self.run_agent(new_tid, messages, self.tools) # start with all tools
 
         with self.thread_records_lock:
-            self.thread_records[new_tid]['start_time'] = result['start_time']
-            self.thread_records[new_tid]['end_time'] = result['end_time']
+            self.thread_records[new_tid]['start_time'] = result.start_time
+            self.thread_records[new_tid]['end_time'] = result.end_time
             self.thread_records[new_tid]['join_time'] = time.time()
 
         self.join_all_threads()
@@ -601,7 +658,13 @@ class ForkManager:
         name_with_datetime = "graph_" + time.strftime("%Y%m%d_%H%M%S")
         self.save_thread_records(name_with_datetime)
 
-        result_str = cast(str | None, result['result'])
+        if self.artifact_dir is not None:
+            # save message history to a file
+            messages_path = f"{self.artifact_dir}/messages.json"
+            with open(messages_path, 'w') as f:
+                json.dump(messages, f, indent=4)
+
+        result_str = result.result
         return result_str
 
 

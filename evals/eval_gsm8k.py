@@ -52,7 +52,8 @@ def main():
 
         print(f"Evaluating {agent_class.__name__} on GSM8K dataset...")
         # no extra tools for GSM8K
-        result = evaluator(agent_factory=lambda: agent_class(extra_tools=None, artifact_dir=result_folder))
+        result = evaluator(agent_factory=lambda sample_id: agent_class(
+            extra_tools=None, artifact_dir=os.path.join(result_folder, sample_id)))
         print(f"Results for {agent_class.__name__}:")
         print(result)     
 

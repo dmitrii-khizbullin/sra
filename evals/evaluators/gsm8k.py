@@ -1,6 +1,6 @@
 import random
 import re
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 from agents.agent_base import AgentBase
 from evals.evaluators.equality_checker_base import EqualityCheckerBase
@@ -45,18 +45,19 @@ class Gsm8kEvaluator(EvalBase):
             assert n_repeats == 1, "n_repeats only supported for num_examples = None"
             rng = random.Random(0)
             examples = rng.sample(examples, num_examples)
-        self.examples = examples * n_repeats
+        self.examples: list[dict[str, Any]] = examples * n_repeats
         self.equality_checker = Gsm8kEqualityChecker()
         self.max_concurrent_tasks = max_concurrent_tasks
 
-    def __call__(self, agent_factory: Callable[[], AgentBase]) -> EvalResult:
+    def __call__(self, agent_factory: Callable[[str], AgentBase]) -> EvalResult:
         def fn(row: dict):
             question = row["question"]
             content = question + "\n\n" + self.equality_checker.get_format_instruction()
             prompt_messages = [
                 dict(role="user", content=content)
             ]
-            agent = agent_factory()
+            sample_id = row['id']
+            agent = agent_factory(sample_id)
             agent_result = agent(prompt_messages)
             response_text = agent_result.response
             ground_truth_answer = row["answer"].split('#### ')[-1]
@@ -71,5 +72,6 @@ class Gsm8kEvaluator(EvalBase):
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
             return SingleEvalResult(html=html, score=score, convo=convo)
 
-        results = common.map_with_progress(fn, self.examples, num_threads=self.max_concurrent_tasks)
+        examples = [d | dict(id=f"{i:04d}") for i, d in enumerate(self.examples)]
+        results = common.map_with_progress(fn, examples, num_threads=self.max_concurrent_tasks)
         return common.aggregate_results(results)
