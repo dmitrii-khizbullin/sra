@@ -1,15 +1,15 @@
 import json
 import threading
 import time
-from typing import Any
+from typing import Any, cast
 import string
 import random
 import re
 import concurrent.futures
 
-from vllm_like import LLM, SamplingParams
-from utils import suppress_tqdm
-from svg_gantt_generator import SVGGanttGenerator, Task
+from .vllm_like import LLM, SamplingParams
+from .utils import suppress_tqdm
+from .svg_gantt_generator import SVGGanttGenerator, Task
 
 
 TOOLS = [
@@ -202,10 +202,11 @@ def remove_forking_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class ForkManager:
     def __init__(self, 
                  llm: LLM,
-                 tools: list[dict[str, Any]],
+                 extra_tools: list[dict[str, Any]] | None,
                  ):
         self.llm = llm
-        self.tools = tools
+
+        self.tools = TOOLS + (extra_tools if extra_tools is not None else [])
 
         self.max_tokens = 1000
 
@@ -385,42 +386,46 @@ class ForkManager:
         tool_name = func["name"]
         tool_args = func["arguments"]
         if tool_name in self.tools_functions:
-            print(f"MyTID={my_tid}, Tool call: {tool_name}, args: {tool_args}")
-            if tool_name == 'fork':
-                messages_forking = messages.copy()
-                messages_forking.append(tool_call)
-                unexpected_args = set(tool_args.keys()) - {"message_ids", "message"}
-                no_unexpected_args = len(unexpected_args) == 0
-                is_message_good = (("message" not in tool_args) or
-                                   isinstance(tool_args["message"], str))
-                is_message_ids_good = (("message_ids" not in tool_args) or
-                                       (isinstance(tool_args["message_ids"], list) and
-                                        all(isinstance(x, str) for x in tool_args["message_ids"])))
-                if no_unexpected_args and is_message_good and is_message_ids_good:
-                    tool_answer = self.fork(
-                        my_tid=my_tid,
-                        messages=messages_forking,
-                        tools=tools,
-                        **tool_args)
+            enabled_tools = {tool["function"]["name"] for tool in tools}
+            if tool_name in enabled_tools:
+                print(f"MyTID={my_tid}, Tool call: {tool_name}, args: {tool_args}")
+                if tool_name == 'fork':
+                    messages_forking = messages.copy()
+                    messages_forking.append(tool_call)
+                    unexpected_args = set(tool_args.keys()) - {"message_ids", "message"}
+                    no_unexpected_args = len(unexpected_args) == 0
+                    is_message_good = (("message" not in tool_args) or
+                                    isinstance(tool_args["message"], str))
+                    is_message_ids_good = (("message_ids" not in tool_args) or
+                                        (isinstance(tool_args["message_ids"], list) and
+                                            all(isinstance(x, str) for x in tool_args["message_ids"])))
+                    if no_unexpected_args and is_message_good and is_message_ids_good:
+                        tool_answer = self.fork(
+                            my_tid=my_tid,
+                            messages=messages_forking,
+                            tools=tools,
+                            **tool_args)
+                    else:
+                        tool_answer = "Invalid arguments for fork."
+                elif tool_name == 'join':
+                    unexpected_args = set(tool_args.keys()) - {"tids"}
+                    no_unexpected_args = len(unexpected_args) == 0
+                    is_tids_good = "tids" in tool_args and (
+                        isinstance(tool_args["tids"], list) and
+                        all(isinstance(x, str) for x in tool_args["tids"])
+                        )
+                    if no_unexpected_args and is_tids_good:
+                        tool_answer = self.join(my_tid, **tool_args)
+                    else:
+                        tool_answer = "Invalid arguments for join."
+                elif tool_name == 'status':
+                    tool_answer = self.status(my_tid)
+                elif tool_name == 'finish':
+                    tool_answer = self.finish(messages=messages, **tool_args)
                 else:
-                    tool_answer = "Invalid arguments for fork."
-            elif tool_name == 'join':
-                unexpected_args = set(tool_args.keys()) - {"tids"}
-                no_unexpected_args = len(unexpected_args) == 0
-                is_tids_good = "tids" in tool_args and (
-                    isinstance(tool_args["tids"], list) and
-                    all(isinstance(x, str) for x in tool_args["tids"])
-                    )
-                if no_unexpected_args and is_tids_good:
-                    tool_answer = self.join(my_tid, **tool_args)
-                else:
-                    tool_answer = "Invalid arguments for join."
-            elif tool_name == 'status':
-                tool_answer = self.status(my_tid)
-            elif tool_name == 'finish':
-                tool_answer = self.finish(messages=messages, **tool_args)
+                    raise ValueError(f"Unknown tool name: {tool_name}")
             else:
-                raise ValueError(f"Unknown tool name: {tool_name}")
+                tool_answer = f"Tool {tool_name} is disabled."
         else:
             tool_answer = f"Tool {tool_name} does not exist."
         return tool_answer
@@ -443,7 +448,8 @@ class ForkManager:
                     sampling_params=self.sampling_params,
                     tools=tools,
                     )
-            output = outputs[0].outputs[0].text.strip()
+            output = outputs.choices[0].message.content
+            output = output if output is not None else ""
             content = remove_tool_calls(output)
             messages.append({"role": "assistant", "content": content})
             tool_calls = extract_tool_calls(output)
@@ -506,7 +512,10 @@ class ForkManager:
                             result = future.result(timeout=0.001)
                             record['start_time'] = result['start_time']
                             record['end_time'] = result['end_time']
-                            record['join_time'] = time.time()
+                            # if record['join_time'] is None:
+                            #     record['join_time'] = time.time()
+                            # else:
+                            #     print(f"Thread {tid} already joined at {record['join_time']}.")
                             print(f"Joining thread {tid} with parent {record['parent_tid']}, level {record['level']}")
                             unfinished_tids.remove(tid)
                         except concurrent.futures.TimeoutError:
@@ -551,20 +560,23 @@ class ForkManager:
             "#ff6b6b", "#4ecdc4", "#ffa500", "#8a2be2", "#00ff7f",
         ]
 
-        very_start_time = None
+        time_zero = None
         for tid, record in records_json.items():
-            start_time = record["start_time"]
-            if very_start_time is None or start_time < very_start_time:
-                very_start_time = start_time
-        if very_start_time is not None:
+            fork_time = record["fork_time"]
+            if time_zero is None or fork_time < time_zero:
+                time_zero = fork_time
+        if time_zero is not None:
             for tid, record in records_json.items():
                 start_time = record["start_time"]
+                if start_time is None:
+                    start_time = record["fork_time"]
+                    end_time = record["fork_time"] + 0.1
                 end_time = record["end_time"]
                 if end_time is None:
                     duration = 1.0  # Default duration if end_time is not set
                 else:
                     duration = end_time - start_time
-                relative_start_time = start_time - very_start_time
+                relative_start_time = start_time - time_zero
                 color = colormap[record["level"] % len(colormap)]
                 gantt.add_task(Task(name=f"Thread {tid}",
                                     start_time=relative_start_time,
@@ -576,12 +588,22 @@ class ForkManager:
         # add dependencies
         for tid, record in records_json.items():
             for child_tid in record['child_tids']:
-                gantt.add_dependency((f"Thread {tid}", None), (f"Thread {child_tid}", "start"))
-                gantt.add_dependency((f"Thread {child_tid}", "end"), (f"Thread {tid}", None))
+                child_record = records_json[child_tid]
+                fork_time = child_record['fork_time'] - time_zero
+                if child_record['start_time'] is None:
+                    gantt.add_dependency((f"Thread {tid}", fork_time), (f"Thread {child_tid}", fork_time))
+                    continue
+                start_time = child_record['start_time'] - time_zero
+                gantt.add_dependency((f"Thread {tid}", fork_time), (f"Thread {child_tid}", start_time))
+                if child_record['end_time'] is None or child_record['join_time'] is None:
+                    continue
+                end_time = child_record['end_time'] - time_zero
+                join_time = child_record['join_time'] - time_zero
+                gantt.add_dependency((f"Thread {child_tid}", end_time), (f"Thread {tid}", join_time))
 
         return gantt
 
-    def run_entry(self, messages):
+    def run_entry(self, task: str) -> str:
         safety_gap = 2.0
         max_words = self.max_tokens // 2 // safety_gap # Rough estimate of words based on tokens
 
@@ -624,19 +646,13 @@ class ForkManager:
         name_with_datetime = "graph_" + time.strftime("%Y%m%d_%H%M%S")
         self.save_thread_records(name_with_datetime)
 
-        return result['result']
+        result_str = cast(str, result['result'])
+        return result_str
 
 
-if __name__ == "__main__":
+def main():
     llm = LLM()
     
-    sampling_params = SamplingParams(max_tokens=1000, temperature=0.0)
-    prompt = "What is the capital of France?"
-    response = llm.generate(prompt, sampling_params=sampling_params)    
-    print(response)
-
-    # ===============================================
-
     problem = """
     You're a contestant on a game show. The host, Monty Hall, presents you with three doors. Behind one door is a valuable prize (like a car), and behind the other two doors are less desirable prizes (like goats).
     The Setup:
@@ -647,8 +663,17 @@ if __name__ == "__main__":
 
     The Question: What should you do to maximize your chances of winning the car?"""
 
-    task = f"Solve the following problem with 5 different methods:\n\n {problem}"
+    sampling_params = SamplingParams(max_tokens=1000, temperature=0.0)
+    response = llm.chat([dict(role='user', content=problem)], sampling_params=sampling_params)
+    print(response.choices[0].message.content)
 
+    # ===============================================
+
+    task = f"Solve the following problem with 5 different methods:\n\n {problem}"
     fork_manager = ForkManager(llm, TOOLS)
     response = fork_manager.run_entry(task)
     print(response)
+
+
+if __name__ == "__main__":
+    main()

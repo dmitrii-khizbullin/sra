@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import json
 
 # (Task name, Bar End spec), Bar end: start, end, None (the same time stamp as another task spec)
-TaskEndSpec = tuple[str, str | None]
+TaskEndSpec = tuple[str, str | float | None]
 
 @dataclass
 class Task:
@@ -383,10 +383,16 @@ class SVGGanttGenerator:
                 to_task_obj = self.tasks[to_idx]
                 
                 # Calculate positions
-                from_time = (from_task_obj.end_time if from_end == "end" else
-                             from_task_obj.start_time if from_end == "start" else None)
-                to_time = (to_task_obj.start_time if to_end == "start" else
-                                to_task_obj.end_time if to_end == "end" else None)
+                from_time = (
+                    from_end if isinstance(from_end, float) else
+                    from_task_obj.end_time if from_end == "end" else
+                    from_task_obj.start_time if from_end == "start" else None
+                    )
+                to_time = (
+                    to_end if isinstance(to_end, float) else
+                    to_task_obj.start_time if to_end == "start" else
+                    to_task_obj.end_time if to_end == "end" else None
+                    )
                 if from_time is None:
                     from_time = to_time
                 if to_time is None:
@@ -549,7 +555,7 @@ class SVGGanttGenerator:
 if __name__ == "__main__":
 
     # Load the JSON file
-    with open("graph_20250627_142226.json", "r") as file:
+    with open("graph_20250627_160252.json", "r") as file:
         data = json.load(file)
 
     from fork_manager import ForkManager
